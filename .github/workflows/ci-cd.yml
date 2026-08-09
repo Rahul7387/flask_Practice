@@ -38,18 +38,14 @@ jobs:
 
       # Stage 3: Test
       - name: Run tests
-        id: test
         env:
           MONGO_URI: mongodb://localhost:27017/test_student_db
           SECRET_KEY: testing-secret-key
         run: |
-          pytest test_app.py -v --tb=short 2>&1 || echo "TEST_FAILED=true" >> $GITHUB_ENV
-
-      - name: Fail if tests failed
-        if: env.TEST_FAILED == 'true'
-        run: |
-          echo "FAILED_STAGE=test" >> $GITHUB_ENV
-          exit 1
+          pytest test_app.py -v --tb=short || {
+            echo "FAILED_STAGE=test" >> $GITHUB_ENV
+            exit 1
+          }
 
       # Stage 4: Build Docker image
       - name: Set image tag
