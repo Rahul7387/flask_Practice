@@ -1,0 +1,168 @@
+name: CI/CD Pipeline - Flask App
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: flask-practice
+  EC2_HOST: ${{ secrets.EC2_HOST }}
+  EC2_USER: ubuntu
+  CONTAINER_NAME: flask-app
+  APP_PORT: 5000
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Stage 1: Checkout
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Stage 2: Install dependencies
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Stage 3: Test
+      - name: Run tests
+        id: test
+        run: |
+          pytest test_app.py -v --tb=short 2>&1 || echo "TEST_FAILED=true" >> $GITHUB_ENV
+
+      - name: Fail if tests failed
+        if: env.TEST_FAILED == 'true'
+        run: |
+          echo "FAILED_STAGE=test" >> $GITHUB_ENV
+          exit 1
+
+      # Stage 4: Build Docker image
+      - name: Set image tag
+        run: |
+          echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+          echo "FULL_IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Build Docker image
+        id: build
+        run: |
+          docker build -t ${{ env.FULL_IMAGE }} . || {
+            echo "FAILED_STAGE=build" >> $GITHUB_ENV
+            exit 1
+          }
+
+      # Stage 5: Push to ECR
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image to ECR
+        run: |
+          docker push ${{ env.FULL_IMAGE }} || {
+            echo "FAILED_STAGE=push" >> $GITHUB_ENV
+            exit 1
+          }
+
+      # Stage 6: Deploy to EC2
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Login to ECR
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+            # Pull new image
+            docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+            # Stop and remove old container
+            docker stop ${{ env.CONTAINER_NAME }} || true
+            docker rm ${{ env.CONTAINER_NAME }} || true
+
+            # Run new container
+            docker run -d \
+              --name ${{ env.CONTAINER_NAME }} \
+              --restart unless-stopped \
+              -p ${{ env.APP_PORT }}:5000 \
+              -e MONGO_URI='${{ secrets.MONGO_URI }}' \
+              -e SECRET_KEY='${{ secrets.SECRET_KEY }}' \
+              ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      # Stage 7: Health check verification
+      - name: Verify deployment
+        run: |
+          echo "Waiting for app to start..."
+          sleep 10
+          for i in 1 2 3 4 5; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://${{ secrets.EC2_HOST }}:${{ env.APP_PORT }}/health || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Health check passed!"
+              exit 0
+            fi
+            echo "Attempt $i: got $HTTP_CODE, retrying in 5s..."
+            sleep 5
+          done
+          echo "FAILED_STAGE=deploy" >> $GITHUB_ENV
+          echo "Health check failed after 5 attempts"
+          exit 1
+
+      # Stage 8: Success email notification
+      - name: Send success email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "✅ SUCCESS - Pipeline #${{ github.run_number }} deployed"
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: ${{ secrets.SMTP_USERNAME }}
+          body: |
+            ✅ DEPLOYMENT SUCCESSFUL
+
+            Pipeline Run: #${{ github.run_number }}
+            Branch: ${{ github.ref_name }}
+            Commit SHA: ${{ github.sha }}
+            Docker Image Tag: ${{ github.sha }}
+            ECR Image: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            EC2 Instance: ${{ secrets.EC2_HOST }}
+            Triggered by: ${{ github.actor }}
+
+            Pipeline Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # Stage 9: Failure email notification
+      - name: Send failure email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ FAILED - Pipeline #${{ github.run_number }}"
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: ${{ secrets.SMTP_USERNAME }}
+          body: |
+            ❌ PIPELINE FAILED
+
+            Failed Stage: ${{ env.FAILED_STAGE || 'unknown' }}
+            Pipeline Run: #${{ github.run_number }}
+            Branch: ${{ github.ref_name }}
+            Commit SHA: ${{ github.sha }}
+            Triggered by: ${{ github.actor }}
+
+            Investigate here: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
